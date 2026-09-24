@@ -1,7 +1,8 @@
 # 播客转写字幕分段 API（Podcast Subtitle Segmentation API）
 
 接收播客转写后按时间排列的词序列，在硬约束下用**动态规划**求出总分最低的字幕分段方案，
-同时返回分段 JSON 与 SRT 字幕文本。基于 Python 3.12 + FastAPI。
+同时返回分段 JSON 与 SRT 字幕文本；另提供**广告插播点**接口，在词间静音处选出
+总静音最长、满足间隔约束的插播位置。基于 Python 3.12 + FastAPI。
 
 ## 一条命令启动
 
@@ -12,6 +13,7 @@ docker compose up --build
 服务监听并映射到宿主机 **`http://localhost:8000`**。
 
 - 分段接口：`POST http://localhost:8000/segments`
+- 广告插播点接口：`POST http://localhost:8000/ad-breaks`
 - 健康检查：`GET http://localhost:8000/health`
 - 交互式 API 文档（Swagger UI）：`http://localhost:8000/docs`
 
@@ -123,6 +125,94 @@ curl -s http://localhost:8000/segments \
   -d '{"words":[{"start_ms":0,"end_ms":1800,"text":"大家好。","speaker":"A"},{"start_ms":1800,"end_ms":6100,"text":"今天聊动态规划。","speaker":"A"},{"start_ms":6100,"end_ms":8200,"text":"我同意。","speaker":"B"}]}'
 ```
 
+## 广告插播点：`POST /ad-breaks`
+
+在相邻词之间的静音处选择 `break_count` 个插播点，使选中静音的总毫秒数最大。
+`words` 字段与 `/segments` 完全相同，并沿用同一套词序与时间校验（422 错误码一致）。
+
+```json
+{
+  "words": [
+    {"start_ms": 0,    "end_ms": 1800, "text": "大家好。",   "speaker": "A"},
+    {"start_ms": 2600, "end_ms": 5200, "text": "今天聊聊",   "speaker": "A"},
+    {"start_ms": 5900, "end_ms": 6800, "text": "动态规划。", "speaker": "A"},
+    {"start_ms": 7600, "end_ms": 9700, "text": "下期再见。", "speaker": "B"}
+  ],
+  "break_count": 2,
+  "min_silence_ms": 500,
+  "min_spacing_ms": 1000
+}
+```
+
+字段说明（`words` 之外）：
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| `break_count` | 整数，1～5 | 需要选出的插播点个数，必须恰好选满 |
+| `min_silence_ms` | 正整数 | 候选静音时长下限：相邻词间隔达到该值才成为候选 |
+| `min_spacing_ms` | 非负整数 | 任意相邻选中插播点的最小时间间隔 |
+
+### 选择规则
+
+1. **候选**：仅取相邻词之间静音时长 `>= min_silence_ms` 的位置，插播时间为
+   静音区间的**整数中点** `(silence_start_ms + silence_end_ms) // 2`；
+2. **约束**：恰好选出 `break_count` 个候选，任意相邻选中时间至少相隔
+   `min_spacing_ms`；
+3. **目标**：选中静音的总毫秒数最大；同分时取**时间序列字典序最小**的方案；
+4. 不存在满足全部约束的方案时返回 **422**（`infeasible_ad_breaks`）。
+
+### 响应示例（200）
+
+```json
+{
+  "breaks": [
+    {
+      "index": 0,
+      "time_ms": 2200,
+      "silence_start_ms": 1800,
+      "silence_end_ms": 2600,
+      "silence_ms": 800
+    },
+    {
+      "index": 1,
+      "time_ms": 7200,
+      "silence_start_ms": 6800,
+      "silence_end_ms": 7600,
+      "silence_ms": 800
+    }
+  ],
+  "total_silence_ms": 1600
+}
+```
+
+> 上例三处候选静音为 800ms（中点 2200）、700ms（中点 5550）、800ms（中点 7200），
+> 两两间隔均满足 `min_spacing_ms=1000`；总静音最大的组合是首尾两处（1600ms）。
+> `breaks` 始终按时间升序返回，`index` 为 0-based 序号。
+
+### curl 示例
+
+```bash
+curl -s http://localhost:8000/ad-breaks \
+  -H 'Content-Type: application/json' \
+  -d '{"words":[{"start_ms":0,"end_ms":1800,"text":"大家好。","speaker":"A"},{"start_ms":2600,"end_ms":5200,"text":"今天聊聊","speaker":"A"},{"start_ms":5900,"end_ms":6800,"text":"动态规划。","speaker":"A"},{"start_ms":7600,"end_ms":9700,"text":"下期再见。","speaker":"B"}],"break_count":2,"min_silence_ms":500,"min_spacing_ms":1000}'
+```
+
+### 无可行插播方案
+
+候选不足 `break_count` 个，或候选间距离无法满足 `min_spacing_ms` 时，返回 422，
+并附带候选数与请求的插播点数：
+
+```json
+{
+  "error": {
+    "code": "infeasible_ad_breaks",
+    "message": "不存在满足全部约束的插播方案",
+    "break_count": 2,
+    "candidate_count": 1
+  }
+}
+```
+
 ## 错误响应（HTTP 422）
 
 统一形如：`{"error": {"code": "...", "message": "...", ...}}`
@@ -133,7 +223,8 @@ curl -s http://localhost:8000/segments \
 | `invalid_time_range` | 某个词 `end_ms < start_ms` | `word_index` |
 | `time_out_of_order` | 相邻词 `start_ms` 倒序 | `word_index` |
 | `overlapping_time_range` | 某词 `start_ms` 早于前词 `end_ms`（重叠） | `word_index` |
-| `infeasible_segmentation` | 不存在满足全部硬约束的分段 | `last_word_index` |
+| `infeasible_segmentation` | 不存在满足全部约束的分段 | `last_word_index` |
+| `infeasible_ad_breaks` | 不存在满足全部约束的插播方案 | `break_count`、`candidate_count` |
 
 ### 无可行分段
 
@@ -177,6 +268,12 @@ curl -s http://localhost:8000/segments \
 > 早期版本曾把整条断点序列保存在 DP 状态里，会退化为 O(n²)；当前实现每状态
 > 只存一个分数，字典序裁决全部推迟到重建阶段，10 万词约数秒、内存约 60MB。
 
+广告插播点选择（`ad_breaks.py`）同样为动态规划，**O(m·k) 时间/空间**
+（m 为候选数、k = break_count ≤ 5）：候选静音区间的中点随词序严格递增，
+先用双指针扫出每个候选之后第一个满足 `min_spacing_ms` 的下标，再按
+“恰选 j 个”分层做后缀最大 DP，最后从左向右贪心重建——每步取仍能达成
+最优总静音的最小下标，即得字典序最小的时间序列。
+
 ## 测试
 
 核心算法只依赖 Python 标准库，无需安装任何第三方包即可运行：
@@ -199,10 +296,12 @@ app/
   main.py          # FastAPI 路由、异常处理（422 统一错误体）
   schemas.py       # 请求/响应 Pydantic 模型
   segmentation.py  # 输入校验 + 动态规划核心（纯标准库）
+  ad_breaks.py     # 广告插播点选择（纯标准库，复用同一套输入校验）
   srt.py           # SRT 渲染
   errors.py        # DomainError
 tests/             # unittest：核心算法、暴力对拍、HTTP 接口层
   test_segmentation.py
+  test_ad_breaks.py
   test_differential.py
   test_api.py
 Dockerfile

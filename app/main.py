@@ -1,18 +1,20 @@
-"""FastAPI 入口：POST /segments 字幕分段服务。"""
+"""FastAPI 入口：POST /segments 字幕分段、POST /ad-breaks 广告插播点服务。"""
 
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
+from .ad_breaks import optimal_ad_breaks
 from .errors import DomainError
-from .schemas import SegmentRequest, SegmentResponse
+from .schemas import AdBreakRequest, AdBreakResponse, SegmentRequest, SegmentResponse
 from .segmentation import optimal_segmentation
 from .srt import render_srt
 
 app = FastAPI(
     title="Podcast Subtitle Segmentation API",
-    description="播客转写后处理：在硬约束下用动态规划求最优字幕分段，返回 JSON 与 SRT。",
-    version="1.0.0",
+    description="播客转写后处理：在硬约束下用动态规划求最优字幕分段（JSON 与 SRT），"
+    "并在词间静音处选择最优广告插播点。",
+    version="1.1.0",
 )
 
 
@@ -33,7 +35,8 @@ async def validation_exception_handler(_: Request, exc: RequestValidationError):
     return _error_response(
         "invalid_request",
         "请求体不合法：words 必须为非空数组，每项含非负整数 start_ms/end_ms、"
-        "非空字符串 text/speaker",
+        "非空字符串 text/speaker；/ad-breaks 另需 break_count∈[1,5]、"
+        "min_silence_ms≥1、min_spacing_ms≥0",
         {"errors": exc.errors()},
     )
 
@@ -52,3 +55,14 @@ async def create_segments(request: SegmentRequest):
         total_score=total_score,
         srt=render_srt(segments),
     )
+
+
+@app.post("/ad-breaks", response_model=AdBreakResponse)
+async def create_ad_breaks(request: AdBreakRequest):
+    breaks, total_silence_ms = optimal_ad_breaks(
+        request.words,
+        request.break_count,
+        request.min_silence_ms,
+        request.min_spacing_ms,
+    )
+    return AdBreakResponse(breaks=breaks, total_silence_ms=total_silence_ms)
