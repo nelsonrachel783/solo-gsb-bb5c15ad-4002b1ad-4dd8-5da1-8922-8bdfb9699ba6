@@ -1,11 +1,17 @@
-"""FastAPI 入口：POST /segments 字幕分段服务。"""
+"""FastAPI 入口：POST /segments 字幕分段、POST /ad-breaks 广告插播点服务。"""
 
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
+from .ad_breaks import select_ad_breaks
 from .errors import DomainError
-from .schemas import SegmentRequest, SegmentResponse
+from .schemas import (
+    AdBreakRequest,
+    AdBreakResponse,
+    SegmentRequest,
+    SegmentResponse,
+)
 from .segmentation import optimal_segmentation
 from .srt import render_srt
 
@@ -33,7 +39,8 @@ async def validation_exception_handler(_: Request, exc: RequestValidationError):
     return _error_response(
         "invalid_request",
         "请求体不合法：words 必须为非空数组，每项含非负整数 start_ms/end_ms、"
-        "非空字符串 text/speaker",
+        "非空字符串 text/speaker；break_count 取 1~5、min_silence_ms 为正整数、"
+        "min_spacing_ms 为非负整数",
         {"errors": exc.errors()},
     )
 
@@ -52,3 +59,14 @@ async def create_segments(request: SegmentRequest):
         total_score=total_score,
         srt=render_srt(segments),
     )
+
+
+@app.post("/ad-breaks", response_model=AdBreakResponse)
+async def create_ad_breaks(request: AdBreakRequest):
+    breaks, total_silence = select_ad_breaks(
+        request.words,
+        request.break_count,
+        request.min_silence_ms,
+        request.min_spacing_ms,
+    )
+    return AdBreakResponse(breaks=breaks, total_silence_ms=total_silence)

@@ -12,6 +12,7 @@ docker compose up --build
 服务监听并映射到宿主机 **`http://localhost:8000`**。
 
 - 分段接口：`POST http://localhost:8000/segments`
+- 广告插播点接口：`POST http://localhost:8000/ad-breaks`
 - 健康检查：`GET http://localhost:8000/health`
 - 交互式 API 文档（Swagger UI）：`http://localhost:8000/docs`
 
@@ -134,6 +135,7 @@ curl -s http://localhost:8000/segments \
 | `time_out_of_order` | 相邻词 `start_ms` 倒序 | `word_index` |
 | `overlapping_time_range` | 某词 `start_ms` 早于前词 `end_ms`（重叠） | `word_index` |
 | `infeasible_segmentation` | 不存在满足全部硬约束的分段 | `last_word_index` |
+| `infeasible_ad_breaks` | `/ad-breaks` 不存在满足数量与间距约束的插播方案 | `candidate_count`（满足静音阈值的候选数） |
 
 ### 无可行分段
 
@@ -159,6 +161,74 @@ curl -s http://localhost:8000/segments \
 
 （该词仅 800ms 且无法与前后词组合成 ≥1000ms 的段。）
 
+## 广告插播点：`POST /ad-breaks`
+
+接收与 `/segments` 相同的 `words`（沿用词序及时间校验：按时间排列、不重叠、
+端点允许相接），另带三个参数：
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| `break_count` | 整数 **1～5** | 需要的插播点数量，**恰选**该数量 |
+| `min_silence_ms` | **正整数** | 仅在静音长度不少于该值的相邻词之间生成候选 |
+| `min_spacing_ms` | **非负整数** | 任意相邻两个选中插播点的时间至少相隔的毫秒数 |
+
+候选只产生于**相邻词之间**：静音区间为 `[前词 end_ms, 后词 start_ms]`，
+插播时间取该区间的**整数中点**（`(start+end)//2`，奇数向下取整）。
+端点相接（静音 0）不会成为候选。
+
+在满足全部约束的方案中，使**选中静音总毫秒数最大**；同分时取
+**时间序列字典序最小**（即最早的插播点尽量靠前）。无可行方案返回 **422**。
+
+### 请求示例
+
+```bash
+curl -s http://localhost:8000/ad-breaks \
+  -H 'Content-Type: application/json' \
+  -d '{"words":[{"start_ms":0,"end_ms":500,"text":"今","speaker":"A"},{"start_ms":800,"end_ms":1300,"text":"天","speaker":"A"},{"start_ms":2100,"end_ms":2600,"text":"聊","speaker":"A"},{"start_ms":3000,"end_ms":3500,"text":"天","speaker":"A"}],"break_count":2,"min_silence_ms":300,"min_spacing_ms":0}'
+```
+
+相邻静音依次为 300、800、400ms；选 2 个时取 800+400=1200ms：
+
+```json
+{
+  "breaks": [
+    {
+      "index": 0,
+      "time_ms": 1700,
+      "silence_start_ms": 1300,
+      "silence_end_ms": 2100,
+      "silence_ms": 800,
+      "after_word": 1
+    },
+    {
+      "index": 1,
+      "time_ms": 2800,
+      "silence_start_ms": 2600,
+      "silence_end_ms": 3000,
+      "silence_ms": 400,
+      "after_word": 2
+    }
+  ],
+  "total_silence_ms": 1200
+}
+```
+
+> `breaks` 按时间排列，`index` 从 0 起；`after_word` 表示插播点位于该词
+> （0-based、含）与其后一词之间。上例三个候选中点为 650、1700、2800；
+> 若把 `min_spacing_ms` 提高到 `1200`，则 650 与 1700 相距仅 1050ms 不能
+> 同选，最优变为 650+2800（300+400=700ms）；若任何组合都无法满足数量与
+> 间距（如候选不足 `break_count` 个），则返回 422：
+
+```json
+{
+  "error": {
+    "code": "infeasible_ad_breaks",
+    "message": "不存在满足全部约束的插播方案",
+    "candidate_count": 2
+  }
+}
+```
+
 ## 算法说明
 
 两趟动态规划 + 贪心重建，**O(n) 时间、O(n) 空间**：
@@ -176,6 +246,22 @@ curl -s http://localhost:8000/segments \
 
 > 早期版本曾把整条断点序列保存在 DP 状态里，会退化为 O(n²)；当前实现每状态
 > 只存一个分数，字典序裁决全部推迟到重建阶段，10 万词约数秒、内存约 60MB。
+
+### 广告插播点的选取算法
+
+`/ad-breaks` 为带间距约束的“恰选 K 个、权值和最大”问题（K≤5），采用
+**后向 DP + 贪心重建**，O(m log m + K·m) 时间、O(K·m) 空间，m 为候选数：
+
+1. **候选生成**：扫描相邻词，保留静音 `≥ min_silence_ms` 者，记录其中点与
+   静音长度（权重）；候选时间严格升序；
+2. 二分求出每个候选 `j` 之后“时间相隔 `≥ min_spacing_ms` 的最早候选”
+   `next_ok[j]`，间距约束转化为下标上的单调转移；
+3. **后向 DP**：`g[k][j]` = 在候选 `[j, m)` 中选 k 个且彼此满足间距约束时的
+   最大静音和，转移 `max(不选 j: g[k][j+1], 选 j: w[j] + g[k-1][next_ok[j]])`；
+   `g[K][0]` 不可达即无解（422）；
+4. **贪心重建**：从左到右扫描，当“选当前候选”与“不选”都能取得剩余所需的
+   最优静音和时优先“选”，使当前时间最小，归纳得到时间序列字典序最小的
+   最优解。
 
 ## 测试
 
@@ -199,10 +285,12 @@ app/
   main.py          # FastAPI 路由、异常处理（422 统一错误体）
   schemas.py       # 请求/响应 Pydantic 模型
   segmentation.py  # 输入校验 + 动态规划核心（纯标准库）
+  ad_breaks.py     # 广告插播点选取（后向 DP + 贪心重建，纯标准库）
   srt.py           # SRT 渲染
   errors.py        # DomainError
 tests/             # unittest：核心算法、暴力对拍、HTTP 接口层
   test_segmentation.py
+  test_ad_breaks.py
   test_differential.py
   test_api.py
 Dockerfile

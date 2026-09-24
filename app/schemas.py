@@ -30,3 +30,28 @@ class SegmentResponse(BaseModel):
     segments: list[SegmentOut]
     total_score: int
     srt: str
+
+
+class AdBreakRequest(BaseModel):
+    words: list[WordIn] = Field(..., min_length=1, description="按时间排列的词序列")
+    break_count: int = Field(
+        ..., ge=1, le=5, description="需要插入的广告点数量（恰选该数量）"
+    )
+    min_silence_ms: int = Field(..., ge=1, description="候选静音长度下限（正整数，毫秒）")
+    min_spacing_ms: int = Field(
+        ..., ge=0, description="相邻插播点时间最小间隔（非负整数，毫秒）"
+    )
+
+
+class AdBreakOut(BaseModel):
+    index: int
+    time_ms: int = Field(..., description="插播时间：静音区间的整数中点（毫秒）")
+    silence_start_ms: int = Field(..., description="静音起点（前词 end_ms）")
+    silence_end_ms: int = Field(..., description="静音终点（后词 start_ms）")
+    silence_ms: int = Field(..., description="该静音区间长度（毫秒）")
+    after_word: int = Field(..., description="插播点位于该词（0-based，含）之后")
+
+
+class AdBreakResponse(BaseModel):
+    breaks: list[AdBreakOut]
+    total_silence_ms: int

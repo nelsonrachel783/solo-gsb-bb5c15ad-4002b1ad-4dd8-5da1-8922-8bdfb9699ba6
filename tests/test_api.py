@@ -82,5 +82,127 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(resp.json()["error"]["code"], "invalid_request")
 
 
+@unittest.skipUnless(_HAS_DEPS, "fastapi/httpx 未安装，跳过接口层测试")
+class AdBreakApiTests(unittest.TestCase):
+    def setUp(self):
+        self.client = TestClient(app)
+
+    def _words(self):
+        # 静音：300 / 800 / 400
+        return [
+            {"start_ms": 0, "end_ms": 500, "text": "词", "speaker": "A"},
+            {"start_ms": 800, "end_ms": 1300, "text": "词", "speaker": "A"},
+            {"start_ms": 2100, "end_ms": 2600, "text": "词", "speaker": "A"},
+            {"start_ms": 3000, "end_ms": 3500, "text": "词", "speaker": "A"},
+        ]
+
+    def test_basic_ad_breaks(self):
+        resp = self.client.post(
+            "/ad-breaks",
+            json={
+                "words": self._words(),
+                "break_count": 2,
+                "min_silence_ms": 300,
+                "min_spacing_ms": 0,
+            },
+        )
+        self.assertEqual(resp.status_code, 200)
+        data = resp.json()
+        self.assertEqual(data["total_silence_ms"], 1200)
+        self.assertEqual(len(data["breaks"]), 2)
+        first, second = data["breaks"]
+        # 800ms 与 400ms 两个静音最优，按时间排列
+        self.assertEqual(first["index"], 0)
+        self.assertEqual(first["time_ms"], 1700)
+        self.assertEqual(first["silence_start_ms"], 1300)
+        self.assertEqual(first["silence_end_ms"], 2100)
+        self.assertEqual(first["silence_ms"], 800)
+        self.assertEqual(first["after_word"], 1)
+        self.assertEqual(second["time_ms"], 2800)
+        self.assertEqual(second["silence_ms"], 400)
+
+    def test_infeasible_returns_422(self):
+        # 仅两个候选却要 3 个插播点
+        resp = self.client.post(
+            "/ad-breaks",
+            json={
+                "words": self._words(),
+                "break_count": 3,
+                "min_silence_ms": 350,
+                "min_spacing_ms": 0,
+            },
+        )
+        self.assertEqual(resp.status_code, 422)
+        err = resp.json()["error"]
+        self.assertEqual(err["code"], "infeasible_ad_breaks")
+        self.assertEqual(err["candidate_count"], 2)
+
+    def test_invalid_params_rejected(self):
+        resp = self.client.post(
+            "/ad-breaks",
+            json={
+                "words": self._words(),
+                "break_count": 6,
+                "min_silence_ms": 1,
+                "min_spacing_ms": 0,
+            },
+        )
+        self.assertEqual(resp.status_code, 422)
+        self.assertEqual(resp.json()["error"]["code"], "invalid_request")
+
+        resp = self.client.post(
+            "/ad-breaks",
+            json={
+                "words": self._words(),
+                "break_count": 1,
+                "min_silence_ms": 0,
+                "min_spacing_ms": 0,
+            },
+        )
+        self.assertEqual(resp.status_code, 422)
+        self.assertEqual(resp.json()["error"]["code"], "invalid_request")
+
+        resp = self.client.post(
+            "/ad-breaks",
+            json={
+                "words": self._words(),
+                "break_count": 1,
+                "min_silence_ms": 1,
+                "min_spacing_ms": -1,
+            },
+        )
+        self.assertEqual(resp.status_code, 422)
+        self.assertEqual(resp.json()["error"]["code"], "invalid_request")
+
+    def test_words_validations_reused(self):
+        resp = self.client.post(
+            "/ad-breaks",
+            json={
+                "words": [
+                    {"start_ms": 0, "end_ms": 2000, "text": "甲", "speaker": "A"},
+                    {"start_ms": 1500, "end_ms": 3000, "text": "乙", "speaker": "A"},
+                ],
+                "break_count": 1,
+                "min_silence_ms": 1,
+                "min_spacing_ms": 0,
+            },
+        )
+        self.assertEqual(resp.status_code, 422)
+        self.assertEqual(resp.json()["error"]["code"], "overlapping_time_range")
+
+    def test_segments_still_works(self):
+        resp = self.client.post(
+            "/segments",
+            json={
+                "words": [
+                    {"start_ms": 0, "end_ms": 2000, "text": "第一句。", "speaker": "A"},
+                    {"start_ms": 2000, "end_ms": 4200, "text": "第二句！", "speaker": "B"},
+                ]
+            },
+        )
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.json()["total_score"], 0)
+
+
 if __name__ == "__main__":
     unittest.main()
